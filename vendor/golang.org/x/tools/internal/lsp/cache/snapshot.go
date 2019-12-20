@@ -1,3 +1,7 @@
+// Copyright 2019 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package cache
 
 import (
@@ -443,43 +447,63 @@ func (s *snapshot) getFileURIs() []span.URI {
 	return uris
 }
 
-func (s *snapshot) getFile(uri span.URI) source.FileHandle {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// FindFile returns the file if the given URI is already a part of the view.
+func (s *snapshot) FindFile(ctx context.Context, uri span.URI) source.FileHandle {
+	s.view.mu.Lock()
+	defer s.view.mu.Unlock()
 
-	return s.files[uri]
+	f, err := s.view.findFile(uri)
+	if f == nil || err != nil {
+		return nil
+	}
+	return s.getFileHandle(ctx, f)
 }
 
-func (s *snapshot) Handle(ctx context.Context, f source.File) source.FileHandle {
+// GetFile returns a File for the given URI. It will always succeed because it
+// adds the file to the managed set if needed.
+func (s *snapshot) GetFile(ctx context.Context, uri span.URI) (source.FileHandle, error) {
+	s.view.mu.Lock()
+	defer s.view.mu.Unlock()
+
+	// TODO(rstambler): Should there be a version that provides a kind explicitly?
+	kind := source.DetectLanguage("", uri.Filename())
+	f, err := s.view.getFile(ctx, uri, kind)
+	if err != nil {
+		return nil, err
+	}
+	return s.getFileHandle(ctx, f), nil
+}
+
+func (s *snapshot) getFileHandle(ctx context.Context, f *fileBase) source.FileHandle {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, ok := s.files[f.URI()]; !ok {
-		s.files[f.URI()] = s.view.session.GetFile(f.URI(), f.Kind())
+		s.files[f.URI()] = s.view.session.GetFile(f.URI(), f.kind)
 	}
 	return s.files[f.URI()]
 }
 
-func (s *snapshot) clone(ctx context.Context, withoutFile source.File) *snapshot {
+func (s *snapshot) clone(ctx context.Context, withoutURI span.URI, withoutFileKind source.FileKind) *snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	toInvalidate := map[packageID]struct{}{}
+	directIDs := map[packageID]struct{}{}
 	// Collect all of the package IDs that correspond to the given file.
 	// TODO: if the file has moved into a new package, we should invalidate that too.
-	for _, id := range s.ids[withoutFile.URI()] {
-		toInvalidate[id] = struct{}{}
+	for _, id := range s.ids[withoutURI] {
+		directIDs[id] = struct{}{}
 	}
 
 	// If we are invalidating a go.mod file then we should invalidate all of the packages in the module
-	if withoutFile.Kind() == source.Mod {
+	if withoutFileKind == source.Mod {
 		for id := range s.workspacePackages {
-			toInvalidate[id] = struct{}{}
+			directIDs[id] = struct{}{}
 		}
 	}
 
 	// Get the original FileHandle for the URI, if it exists.
-	originalFH := s.files[withoutFile.URI()]
+	originalFH := s.files[withoutURI]
 
 	// If this is a file we don't yet know about,
 	// then we do not yet know what packages it should belong to.
@@ -487,12 +511,12 @@ func (s *snapshot) clone(ctx context.Context, withoutFile source.File) *snapshot
 	// of all of the files in the same directory as this one.
 	// TODO(rstambler): Speed this up by mapping directories to filenames.
 	if originalFH == nil {
-		if dirStat, err := os.Stat(dir(withoutFile.URI().Filename())); err == nil {
+		if dirStat, err := os.Stat(dir(withoutURI.Filename())); err == nil {
 			for uri := range s.files {
 				if fdirStat, err := os.Stat(dir(uri.Filename())); err == nil {
 					if os.SameFile(dirStat, fdirStat) {
 						for _, id := range s.ids[uri] {
-							toInvalidate[id] = struct{}{}
+							directIDs[id] = struct{}{}
 						}
 					}
 				}
@@ -502,21 +526,26 @@ func (s *snapshot) clone(ctx context.Context, withoutFile source.File) *snapshot
 
 	// If there is no known FileHandle and no known IDs for the given file,
 	// there is nothing to invalidate.
-	if len(toInvalidate) == 0 && originalFH == nil {
+	if len(directIDs) == 0 && originalFH == nil {
 		// TODO(heschi): clone anyway? Seems like this is just setting us up for trouble.
 		return s
 	}
 
 	// Invalidate reverse dependencies too.
 	// TODO(heschi): figure out the locking model and use transitiveReverseDeps?
+	transitiveIDs := make(map[packageID]struct{})
 	var addRevDeps func(packageID)
 	addRevDeps = func(id packageID) {
-		toInvalidate[id] = struct{}{}
+		if _, seen := transitiveIDs[id]; seen {
+			return
+		}
+
+		transitiveIDs[id] = struct{}{}
 		for _, rid := range s.getImportedByLocked(id) {
 			addRevDeps(rid)
 		}
 	}
-	for id := range toInvalidate {
+	for id := range directIDs {
 		addRevDeps(id)
 	}
 
@@ -531,27 +560,33 @@ func (s *snapshot) clone(ctx context.Context, withoutFile source.File) *snapshot
 		files:             make(map[span.URI]source.FileHandle),
 		workspacePackages: make(map[packageID]bool),
 	}
-	// Copy all of the FileHandles except for the one that was invalidated.
+
+	// Copy all of the FileHandles.
 	for k, v := range s.files {
-		if k == withoutFile.URI() {
-			continue
-		}
 		result.files[k] = v
 	}
+	// Handle the invalidated file; it may have new contents or not exist.
+	currentFH := s.view.session.GetFile(withoutURI, withoutFileKind)
+	if _, _, err := currentFH.Read(ctx); os.IsNotExist(err) {
+		delete(result.files, withoutURI)
+	} else {
+		result.files[withoutURI] = currentFH
+	}
+
 	// Collect the IDs for the packages associated with the excluded URIs.
 	for k, ids := range s.ids {
 		result.ids[k] = ids
 	}
 	// Copy the package type information.
 	for k, v := range s.packages {
-		if _, ok := toInvalidate[k.id]; ok {
+		if _, ok := transitiveIDs[k.id]; ok {
 			continue
 		}
 		result.packages[k] = v
 	}
 	// Copy the package analysis information.
 	for k, v := range s.actions {
-		if _, ok := toInvalidate[k.pkg.id]; ok {
+		if _, ok := transitiveIDs[k.pkg.id]; ok {
 			continue
 		}
 		result.actions[k] = v
@@ -561,16 +596,14 @@ func (s *snapshot) clone(ctx context.Context, withoutFile source.File) *snapshot
 		result.workspacePackages[k] = v
 	}
 
-	// Get the current FileHandle for the URI.
-	currentFH := s.view.session.GetFile(withoutFile.URI(), withoutFile.Kind())
-
 	// Check if the file's package name or imports have changed,
 	// and if so, invalidate this file's packages' metadata.
 	invalidateMetadata := s.view.session.cache.shouldLoad(ctx, s, originalFH, currentFH)
 
-	// Copy the package metadata.
+	// Copy the package metadata. We only need to invalidate packages directly
+	// containing the affected file, and only if it changed in a relevant way.
 	for k, v := range s.metadata {
-		if _, ok := toInvalidate[k]; invalidateMetadata && ok {
+		if _, ok := directIDs[k]; invalidateMetadata && ok {
 			continue
 		}
 		result.metadata[k] = v
@@ -582,22 +615,6 @@ func (s *snapshot) clone(ctx context.Context, withoutFile source.File) *snapshot
 
 func (s *snapshot) ID() uint64 {
 	return s.id
-}
-
-// invalidateContent invalidates the content of a Go file,
-// including any position and type information that depends on it.
-// It returns true if we were already tracking the given file, false otherwise.
-func (v *view) invalidateContent(ctx context.Context, f source.File, action source.FileAction) {
-	// This should be the only time we hold the view's snapshot lock for any period of time.
-	v.snapshotMu.Lock()
-	defer v.snapshotMu.Unlock()
-
-	// If we are deleting a file, make sure to clear out the overlay.
-	if action == source.Delete {
-		v.session.clearOverlay(f.URI())
-	}
-
-	v.snapshot = v.snapshot.clone(ctx, f)
 }
 
 func (s *snapshot) clearAndRebuildImportGraph() {
